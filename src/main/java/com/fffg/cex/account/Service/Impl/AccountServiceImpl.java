@@ -13,13 +13,23 @@ import com.fffg.cex.account.VO.AssetLedgerVO;
 import com.fffg.cex.account.VO.PageVO;
 import com.fffg.cex.common.exception.BusinessException;
 import com.fffg.cex.common.exception.ErrorCode;
+import com.fffg.cex.market.Mapper.AssetsMapper;
+import com.fffg.cex.market.VO.AssetVO;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 public class AccountServiceImpl implements AccountService {
 
@@ -32,10 +42,31 @@ public class AccountServiceImpl implements AccountService {
     @Autowired
     private AssetLedgerMapper assetLedgerMapper;
 
+    @Autowired
+    private AssetsMapper assetsMapper;
+
+    /** 创建账户时默认初始化的币种 */
+    private static final List<String> DEFAULT_INIT_ASSETS = Arrays.asList("USDT", "BTC", "ETH");
+
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public AccountVO createAccount(CreateAccountRequestDTO createAccountRequestDTO) {
-         accountMapper.createAccount(createAccountRequestDTO);
-         return accountMapper.getAccountById(createAccountRequestDTO.getId());
+        // 1. 校验用户名是否已存在
+        AccountVO existing = accountMapper.getAccountByUsername(createAccountRequestDTO.getUsername());
+        if (existing != null) {
+            throw new BusinessException(ErrorCode.USERNAME_EXISTS.getCode(), ErrorCode.USERNAME_EXISTS.getMessage());
+        }
+
+        // 2. 创建账户
+        accountMapper.createAccount(createAccountRequestDTO);
+        Long accountId = createAccountRequestDTO.getId();
+
+        // 3. 初始化默认币种余额（余额为0）
+        for (String assetSymbol : DEFAULT_INIT_ASSETS) {
+            accountBalanceMapper.insertBalance(accountId, assetSymbol);
+        }
+
+        return accountMapper.getAccountById(accountId);
     }
 
     @Override
@@ -66,35 +97,67 @@ public class AccountServiceImpl implements AccountService {
             throw new BusinessException(ErrorCode.ACCOUNT_NOT_FOUND.getCode(), ErrorCode.ACCOUNT_NOT_FOUND.getMessage());
         }
 
-        String assetSymbol = request.getAssetSymbol();
+        String assetSymbol = request.getAssetSymbol().toUpperCase();
         BigDecimal amount = request.getAmount();
 
-        // 2. 查询币种是否存在且启用（通过市场模块的资产表校验）
-        // 使用 accountBalance 表判断是否已有该币种记录，如果没有则先创建
+        // 2. 校验币种存在且启用
+        AssetVO asset = assetsMapper.selectBySymbol(assetSymbol);
+        if (asset == null) {
+            throw new BusinessException(ErrorCode.ASSET_NOT_FOUND.getCode(), ErrorCode.ASSET_NOT_FOUND.getMessage());
+        }
+        if (asset.getStatus() == null || asset.getStatus() != 1) {
+            throw new BusinessException(ErrorCode.ASSET_NOT_FOUND.getCode(), "币种未启用");
+        }
+
+        // 3. 校验金额小数位数不超过币种精度
+        if (amount.scale() > asset.getScaleNum()) {
+            throw new BusinessException(ErrorCode.PARAM_ERROR.getCode(),
+                    "金额小数位数不能超过" + asset.getScaleNum() + "位");
+        }
+
+        // 4. 幂等性校验：如果 businessId 已存在则直接返回
+        String businessId = request.getBusinessId();
+        if (businessId != null && !businessId.isBlank()) {
+            AssetLedgerVO existingLedger = assetLedgerMapper.selectByBusinessId(businessId);
+            if (existingLedger != null) {
+                log.warn("重复的充值请求 businessId={}, accountId={}, assetSymbol={}", businessId, accountId, assetSymbol);
+                return;
+            }
+        } else {
+            // 如果没有传入 businessId，则自动生成
+            businessId = "DEP" + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHHmmssSSS"))
+                    + accountId + assetSymbol;
+        }
+
+        // 5. 查询或创建余额记录
         AccountBalanceVO balance = accountBalanceMapper.selectByAccountIdAndAsset(accountId, assetSymbol);
-        BigDecimal beforeAvailable = BigDecimal.ZERO;
-        BigDecimal beforeFrozen = BigDecimal.ZERO;
+        BigDecimal beforeAvailable;
+        BigDecimal beforeFrozen;
 
         if (balance == null) {
-            // 账户没有该币种余额记录，先创建
+            beforeAvailable = BigDecimal.ZERO;
+            beforeFrozen = BigDecimal.ZERO;
             accountBalanceMapper.insertBalance(accountId, assetSymbol);
         } else {
             beforeAvailable = balance.getAvailableBalance();
             beforeFrozen = balance.getFrozenBalance();
         }
 
-        // 3. 增加可用余额
-        accountBalanceMapper.addAvailableBalance(accountId, assetSymbol, amount);
+        // 6. 条件更新：增加可用余额（使用 WHERE 条件确保数据一致性）
+        int updatedRows = accountBalanceMapper.addAvailableBalanceWithCheck(accountId, assetSymbol, amount);
+        if (updatedRows != 1) {
+            throw new BusinessException(ErrorCode.SYSTEM_ERROR.getCode(), "更新余额失败");
+        }
 
         BigDecimal afterAvailable = beforeAvailable.add(amount);
         BigDecimal afterFrozen = beforeFrozen;
 
-        // 4. 插入流水记录
+        // 7. 插入流水记录
         AssetLedgerRecord record = new AssetLedgerRecord();
         record.setAccountId(accountId);
         record.setAssetSymbol(assetSymbol);
         record.setBusinessType("MOCK_DEPOSIT");
-        record.setBusinessId("DEP" + System.currentTimeMillis());
+        record.setBusinessId(businessId);
         record.setChangeAvailable(amount);
         record.setChangeFrozen(BigDecimal.ZERO);
         record.setBeforeAvailable(beforeAvailable);

@@ -31,9 +31,12 @@ API Prefix: /api
 {
   "code": 0,
   "message": "success",
-  "data": {}
+  "data": {},
+  "traceId": "a1b2c3d4e5f6g7h8"
 }
 ```
+
+> **说明**：所有响应中 `traceId` 为可选字段，用于请求追踪和问题排查。客户端可在请求头 `X-Trace-Id` 中传入自定义 traceId，未传入时由服务端自动生成。
 
 失败响应：
 
@@ -406,17 +409,31 @@ public class AccountVO {
 
 #### 业务规则
 
-- 用户名不能为空。
-- 用户名不能重复。
+- 用户名不能为空，长度 3~32 位，只能包含字母、数字和下划线。
+- 用户名不能重复（唯一约束）。
 - 创建账户后，账户状态默认为启用。
-- 可以选择在创建账户时初始化 USDT、BTC、ETH 三个余额账户，余额都为 0。
+- **创建账户时必须初始化 USDT、BTC、ETH 三个余额账户**（余额都为 0），不能省略。这样前端展示更直观，后续查询余额接口始终有数据返回。
 
 #### 可能错误
 
 | code | message | 场景 |
 |---|---|---|
-| 40006 | 用户名不能为空 | 参数校验失败 |
+| 40006 | 用户名不能为空 / 用户名长度必须在3到32位之间 | 参数校验失败 |
+| 40006 | 用户名只能包含字母、数字和下划线 | 参数校验失败 |
 | 40007 | 用户名已存在 | 重复创建 |
+
+#### 实现注意
+
+创建账户时使用 `@Transactional` 保证账户创建和余额初始化的原子性。
+
+```java
+@Transactional(rollbackFor = Exception.class)
+public AccountVO createAccount(CreateAccountRequestDTO request) {
+    // 1. 校验用户名是否已存在（避免唯一约束冲突）
+    // 2. 创建账户
+    // 3. 初始化 USDT、BTC、ETH 三个余额记录
+}
+```
 
 ---
 
@@ -548,6 +565,14 @@ public class DepositRequest {
     @NotNull(message = "充值金额不能为空")
     @DecimalMin(value = "0.00000001", message = "充值金额必须大于0")
     private BigDecimal amount;
+
+    /**
+     * 幂等键：用于防止重复充值。
+     * 客户端每次充值请求应传入唯一值（如UUID），
+     * 服务端根据 business_id 唯一约束判断是否已处理。
+     * 如果不传，由服务端自动生成。
+     */
+    private String businessId;
 }
 ```
 
@@ -564,12 +589,29 @@ public class DepositRequest {
 #### 业务规则
 
 - 账户必须存在。
-- 币种必须存在且启用。
+- 币种必须存在且启用（通过 `asset` 表校验 `status = 1`）。
 - 充值金额必须大于 0。
-- 如果账户没有该币种余额记录，则先创建余额记录。
+- **充值金额的小数位数不能超过币种的 `scale_num`**。例如 USDT 的 `scale_num = 6`，则充值金额最多 6 位小数。
+- **幂等性控制**：请求中的 `businessId` 对应 `asset_ledger.business_id` 唯一键。如果 `businessId` 已存在，服务端直接返回成功（幂等），避免重复充值。如果未传入 `businessId`，服务端自动生成。
+- 如果账户没有该币种余额记录，则先创建余额记录（`available_balance = 0, frozen_balance = 0`）。
 - 增加 `account_balance.available_balance`。
-- 插入一条 `asset_ledger` 流水。
+- 插入一条 `asset_ledger` 流水（`businessType = MOCK_DEPOSIT`）。
 - 余额更新和流水插入必须在同一个事务里完成。
+
+#### 实现注意
+
+```java
+@Transactional(rollbackFor = Exception.class)
+public void deposit(Long accountId, DepositRequest request) {
+    // 1. 校验账户存在
+    // 2. 校验币种存在且启用
+    // 3. 幂等性校验：businessId 是否已存在
+    // 4. 校验金额小数位数 <= asset.scale_num
+    // 5. 查询或创建余额记录
+    // 6. 条件更新：UPDATE account_balance SET available += ? WHERE account_id=? AND asset_symbol=?
+    // 7. 插入流水
+}
+```
 
 #### 余额变化示例
 
@@ -818,10 +860,24 @@ public class OrderVO {
 - 第一阶段只支持 `LIMIT`。
 - 买单冻结计价币，例如 BTCUSDT 买单冻结 USDT。
 - 卖单冻结基础币，例如 BTCUSDT 卖单冻结 BTC。
-- 买单冻结金额：`price * quantity`。
-- 卖单冻结数量：`quantity`。
+- 买单冻结金额：`price * quantity`（结果需按 `priceScale` 截断小数位，使用 `RoundingMode.DOWN`）。
+- 卖单冻结数量：`quantity`（需按 `quantityScale` 截断小数位）。
+- **精度校验**：`price` 的小数位数不能超过交易对的 `priceScale`；`quantity` 的小数位数不能超过交易对的 `quantityScale`。
+- **最小订单金额校验**：买单的 `price * quantity >= minOrderAmount`。
 - 冻结资产和创建订单必须放在同一个事务。
-- 如果余额不足，订单不能创建。
+- 使用**条件更新**防止超扣，然后判断影响行数是否为 1：
+
+```sql
+UPDATE account_balance
+SET available_balance = available_balance - ?,
+    frozen_balance = frozen_balance + ?,
+    updated_at = NOW()
+WHERE account_id = ?
+  AND asset_symbol = ?
+  AND available_balance >= ?;
+```
+
+- 订单创建完成后，应立即触发撮合引擎尝试撮合（见 7.2 节）。
 
 #### 买单冻结示例
 
@@ -1187,24 +1243,63 @@ public class TradeVO {
 
 撮合引擎通常不建议直接开放 HTTP 接口，应该由下单服务内部调用。
 
-建议流程：
+### 并发安全策略（重要）
+
+撮合引擎在内存中操作订单簿，但订单状态和资产余额存储在数据库中。撤单请求可能随时到来，因此必须处理并发问题。
+
+**推荐方案：按交易对加锁**
+
+```java
+// 每个交易对独立加锁，避免不同交易对互相阻塞
+public class OrderBookManager {
+    private final ConcurrentHashMap<String, ReentrantLock> lockMap = new ConcurrentHashMap<>();
+
+    public void executeWithLock(String symbol, Runnable action) {
+        ReentrantLock lock = lockMap.computeIfAbsent(symbol, k -> new ReentrantLock());
+        lock.lock();
+        try {
+            action.run();
+        } finally {
+            lock.unlock();
+        }
+    }
+}
+```
+
+**锁覆盖范围**：下单、撤单、撮合三个操作必须使用同一把锁。
+
+### 订单簿重启恢复
+
+内存订单簿在服务重启后会丢失，需要在启动时从数据库加载所有 `status IN ('NEW', 'PARTIALLY_FILLED')` 的订单到内存。
+
+### 建议流程
 
 ```text
 POST /api/orders
     ↓
+获取交易对锁(symbol Lock)
+    ↓
 校验账户、交易对、余额
     ↓
-冻结资产
+冻结资产（条件更新，影响行数检查）
     ↓
-创建订单
+创建订单（status = NEW）
     ↓
 调用 MatchEngine.match(order)
     ↓
-生成成交记录
+┌─ 循环撮合：while (可继续成交) ─────────────────────┐
+│  从对手方向订单簿取最优订单                           │
+│  如果 buyPrice >= sellPrice：                        │
+│    成交价 = maker 价格                               │
+│    成交数量 = min(taker剩余, maker剩余)               │
+│    生成 TradeFill 记录                               │
+│    更新双方订单已成交数量                              │
+│    执行成交结算（处理价差退款）                        │
+│    生成双方资产流水                                  │
+│  否则：break                                         │
+└────────────────────────────────────────────────────┘
     ↓
-成交结算
-    ↓
-更新订单状态
+释放交易对锁
     ↓
 返回订单结果
 ```
@@ -1314,33 +1409,77 @@ USDT frozenBalance -= 6000
 BTC availableBalance += 0.1
 ```
 
-第一版为了简单，也可以先不处理价差，成交价固定取买单价。但面试展示时，建议处理价差。
+> **⚠️ 必须处理价差**：成交价必须取先挂单价格（maker price），taker 多冻结的差额必须退还。不能"不处理价差"，否则会导致系统资产不平。
 
-### 卖方资产变化
+### 买方完整结算逻辑
+
+```text
+// 1. 扣除冻结（按实际成交金额）
+USDT frozenBalance -= tradeAmount
+
+// 2. 获得 BTC
+BTC availableBalance += tradeQuantity
+
+// 3. 如果有价差（冻结金额 > 实际成交金额），退还差额
+if (frozenAmount > tradeAmount) {
+    USDT availableBalance += (frozenAmount - tradeAmount)
+}
+```
+
+### 卖方完整结算逻辑
 
 卖方冻结 BTC，成交后获得 USDT。
 
 ```text
+// 1. 扣除冻结
 BTC frozenBalance -= tradeQuantity
+
+// 2. 获得 USDT
 USDT availableBalance += tradeAmount
 ```
 
 ### 流水类型
 
-| 场景 | businessType |
-|---|---|
-| 买方获得 BTC | TRADE_BUY |
-| 买方扣除 USDT 冻结 | TRADE_BUY_PAY |
-| 买方退回价差 | TRADE_REFUND |
-| 卖方扣除 BTC 冻结 | TRADE_SELL |
-| 卖方获得 USDT | TRADE_SELL_RECEIVE |
-| 手续费 | FEE |
+| 场景 | businessType | 说明 |
+|---|---|---|
+| 买方获得 BTC | TRADE_BUY | 增加 BTC available |
+| 买方扣除 USDT 冻结 | TRADE_BUY_PAY | 减少 USDT frozen |
+| 买方退回价差 | TRADE_REFUND | 增加 USDT available（如有价差） |
+| 卖方扣除 BTC 冻结 | TRADE_SELL | 减少 BTC frozen |
+| 卖方获得 USDT | TRADE_SELL_RECEIVE | 增加 USDT available |
+| 手续费 | FEE | 扣除手续费 |
 
-第一版可以简化为：
+> **建议**：不要简化成 `TRADE_BUY` / `TRADE_SELL` 两种，细分的流水类型更利于审计和排查。
+
+### trade_fill 表增加手续费字段
+
+```sql
+CREATE TABLE trade_fill (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  trade_no VARCHAR(64) NOT NULL UNIQUE,
+  symbol VARCHAR(32) NOT NULL,
+  buy_order_id BIGINT NOT NULL,
+  sell_order_id BIGINT NOT NULL,
+  buy_account_id BIGINT NOT NULL,
+  sell_account_id BIGINT NOT NULL,
+  price DECIMAL(36,18) NOT NULL,
+  quantity DECIMAL(36,18) NOT NULL,
+  amount DECIMAL(36,18) NOT NULL,
+  buy_fee DECIMAL(36,18) NOT NULL DEFAULT 0,     -- 买方手续费
+  sell_fee DECIMAL(36,18) NOT NULL DEFAULT 0,    -- 卖方手续费
+  created_at DATETIME NOT NULL,
+  INDEX idx_symbol_created_at (symbol, created_at)
+);
+```
+
+### 手续费规则建议
 
 ```text
-TRADE_BUY
-TRADE_SELL
+maker 费率：0.1% （挂单方）
+taker 费率：0.1% （吃单方）
+
+买方手续费 = tradeAmount * takerRate  （用 USDT 支付）
+卖方手续费 = tradeQuantity * makerRate （用 BTC 支付）
 ```
 
 ---
@@ -1743,12 +1882,17 @@ public enum ErrorCode {
 | 40002 | 币种不存在 | assetSymbol 无效 |
 | 40003 | 交易对不存在 | symbol 无效 |
 | 40004 | 余额不足 | 下单、提现、冻结时余额不足 |
-| 40005 | 订单状态非法 | 不能撤销已成交订单等 |
+| 40005 | 订单状态非法 | 不能撤销已成交/已撤销订单 |
 | 40006 | 参数错误 | DTO 参数校验失败 |
 | 40007 | 用户名已存在 | 创建账户重复 |
 | 40008 | 订单不存在 | orderId 无效 |
 | 40009 | 资产余额不存在 | 账户没有该币种余额记录 |
 | 40010 | 重复请求 | 幂等控制失败 |
+| 40011 | 订单已完全成交 | 完全成交的订单不能撤销 |
+| 40012 | 订单已撤销 | 已撤销的订单不能重复撤销 |
+| 40013 | 价格小数位数超出限制 | 价格精度超过交易对的 priceScale |
+| 40014 | 数量小数位数超出限制 | 数量精度超过交易对的 quantityScale |
+| 40015 | 订单金额小于最小交易金额 | price * quantity < minOrderAmount |
 | 50000 | 系统异常 | 未知异常 |
 
 ---
@@ -1828,7 +1972,8 @@ CREATE TABLE asset_ledger (
   after_frozen DECIMAL(36,18) NOT NULL,
   created_at DATETIME NOT NULL,
   INDEX idx_account_asset (account_id, asset_symbol),
-  INDEX idx_business (business_type, business_id)
+  UNIQUE KEY uk_business_id (business_id),    -- 业务幂等性控制
+  INDEX idx_business_type (business_type)
 );
 ```
 
@@ -1849,8 +1994,9 @@ CREATE TABLE trade_order (
   created_at DATETIME NOT NULL,
   updated_at DATETIME NOT NULL,
   INDEX idx_account_id (account_id),
-  INDEX idx_symbol_side_price (symbol, side, price),
-  INDEX idx_status (status)
+  INDEX idx_account_symbol_status (account_id, symbol, status),  -- 查询账户订单列表
+  INDEX idx_symbol_side_price (symbol, side, price),             -- 撮合查询对手盘
+  INDEX idx_status (status)                                       -- 启动时加载有效订单
 );
 ```
 
@@ -1868,8 +2014,12 @@ CREATE TABLE trade_fill (
   price DECIMAL(36,18) NOT NULL,
   quantity DECIMAL(36,18) NOT NULL,
   amount DECIMAL(36,18) NOT NULL,
+  buy_fee DECIMAL(36,18) NOT NULL DEFAULT 0,    -- 买方手续费（USDT）
+  sell_fee DECIMAL(36,18) NOT NULL DEFAULT 0,   -- 卖方手续费（BTC）
   created_at DATETIME NOT NULL,
-  INDEX idx_symbol_created_at (symbol, created_at)
+  INDEX idx_symbol_created_at (symbol, created_at),
+  INDEX idx_buy_order_id (buy_order_id),
+  INDEX idx_sell_order_id (sell_order_id)
 );
 ```
 
@@ -2005,10 +2155,10 @@ README 不需要写所有细节，只写核心接口索引。
 ```md
 ## API Documentation
 
-启动项目后访问 Swagger UI：
+启动项目后访问 Swagger UI（注意 `/api` 上下文路径）：
 
-- http://localhost:8080/swagger-ui.html
-- http://localhost:8080/v3/api-docs
+- http://localhost:8080/api/swagger-ui/index.html
+- http://localhost:8080/api/v3/api-docs
 
 ### Core APIs
 
