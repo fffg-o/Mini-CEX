@@ -61,4 +61,32 @@ public interface AccountBalanceMapper {
     @Update("update account_balance set available_balance = available_balance + #{amount}, updated_at = now() " +
             "where account_id = #{accountId} and asset_symbol = #{assetSymbol}")
     int addAvailableBalanceWithCheck(@Param("accountId") Long accountId, @Param("assetSymbol") String assetSymbol, @Param("amount") BigDecimal amount);
+
+    /**
+     * 减少冻结余额（用于成交结算时扣除冻结）。
+     * 通过 WHERE frozen_balance >= #{amount} 防止超扣。
+     *
+     * @return 影响行数，1表示成功，0表示余额不足
+     */
+    @Update("update account_balance " +
+            "set frozen_balance = frozen_balance - #{amount}, " +
+            "    updated_at = now() " +
+            "where account_id = #{accountId} " +
+            "  and asset_symbol = #{assetSymbol} " +
+            "  and frozen_balance >= #{amount}")
+    int subtractFrozenBalance(@Param("accountId") Long accountId, @Param("assetSymbol") String assetSymbol, @Param("amount") BigDecimal amount);
+
+    /**
+     * 减少可用余额（用于扣手续费等场景）。
+     * 通过 WHERE available_balance >= #{amount} 防止超扣。
+     *
+     * @return 影响行数，1表示成功，0表示余额不足
+     */
+    @Update("update account_balance " +
+            "set available_balance = available_balance - #{amount}, " +
+            "    updated_at = now() " +
+            "where account_id = #{accountId} " +
+            "  and asset_symbol = #{assetSymbol} " +
+            "  and available_balance >= #{amount}")
+    int subtractAvailableBalance(@Param("accountId") Long accountId, @Param("assetSymbol") String assetSymbol, @Param("amount") BigDecimal amount);
 }
