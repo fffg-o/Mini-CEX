@@ -26,5 +26,3 @@ springdoc:
 logging:
   level:
     root: info
-    com.fffg.cex: debug
-    com.fffg.cex.mapper: debug

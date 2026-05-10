@@ -17,4 +17,9 @@ public class SymbolPairServiceImpl implements SymbolPairService {
     public List<SymbolPairVO> getList() {
         return symbolPairMapper.selectList();
     }
+
+    @Override
+    public SymbolPairVO getBySymbol(String symbol) {
+        return symbolPairMapper.selectBySymbol(symbol);
+    }
 }

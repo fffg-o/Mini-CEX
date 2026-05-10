@@ -6,4 +6,6 @@ import java.util.List;
 
 public interface SymbolPairService {
     List<SymbolPairVO> getList();
+
+    SymbolPairVO getBySymbol(String symbol);
 }
