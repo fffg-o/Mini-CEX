@@ -15,6 +15,6 @@ public interface AccountMapper {
     @Options(useGeneratedKeys = true, keyProperty = "id")
     void createAccount(CreateAccountRequestDTO createAccountRequestDTO);
 
-    @Select("select id as accountId, username, status, created_at as createAt, updated_at from account where  id = #{id}")
+    @Select("select id as accountId, username as userName, status, created_at as createdAt, updated_at from account where id = #{id}")
     AccountVO getAccountById(Long id);
 }

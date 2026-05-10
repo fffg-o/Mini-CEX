@@ -9,5 +9,5 @@ public class AccountVO {
     private Long accountId;
     private String userName;
     private Integer status;
-    private LocalDateTime createAt;
+    private LocalDateTime createdAt;
 }
