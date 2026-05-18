@@ -23,6 +23,11 @@ springdoc:
     enabled: true
     path: /swagger-ui/index.html
 
+jwt:
+  secret: YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY3ODkwYWJjZGVmZ2hpamtsbW5vcA==
+  expiration: 3600000
+  issuer: mini-cex
+
 logging:
   level:
     root: info

@@ -14,6 +14,9 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(BusinessException.class)
     public ApiResponse<Void> handleBusinessException(BusinessException e) {
+        if (e.getCode() >= 40100 && e.getCode() < 40200) {
+            log.warn("认证异常: code={}, message={}", e.getCode(), e.getMessage());
+        }
         return ApiResponse.fail(e.getCode(), e.getMessage());
     }
 

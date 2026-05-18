@@ -32,6 +32,12 @@ public enum ErrorCode {
     INVALID_WITHDRAW_STATUS(40017, "提现状态非法"),
     DEPOSIT_NOT_FOUND(40018, "充值记录不存在"),
 
+    // 认证相关 401xx
+    UNAUTHORIZED(40100, "未认证，请先登录"),
+    TOKEN_EXPIRED(40101, "认证令牌已过期"),
+    TOKEN_INVALID(40102, "无效的认证令牌"),
+    INVALID_CREDENTIALS(40103, "用户名或密码错误"),
+
     // 系统异常
     SYSTEM_ERROR(50000, "系统异常");
 
