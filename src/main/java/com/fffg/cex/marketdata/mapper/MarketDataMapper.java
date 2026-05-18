@@ -76,7 +76,7 @@ public interface MarketDataMapper {
      * @param limit      返回数量
      */
     @Select("SELECT " +
-            "  FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(created_at) / #{windowSeconds}) * #{windowSeconds}) AS openTime, " +
+            "  ANY_VALUE(FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(created_at) / #{windowSeconds}) * #{windowSeconds})) AS openTime, " +
             "  SUBSTRING_INDEX(GROUP_CONCAT(CAST(price AS CHAR) ORDER BY created_at), ',', 1) AS openPrice, " +
             "  MAX(price) AS highPrice, " +
             "  MIN(price) AS lowPrice, " +
