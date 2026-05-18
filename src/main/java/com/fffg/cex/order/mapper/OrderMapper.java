@@ -56,9 +56,13 @@ public interface OrderMapper {
     @Update("update trade_order set status = #{status}, updated_at = now() where id = #{id}")
     int updateStatus(@Param("id") Long id, @Param("status") String status);
 
-    @Update("update trade_order set filled_quantity = #{filledQuantity}, updated_at = now() " +
+    /**
+     * 增量更新已成交数量（解决撮合过程中 DB 值与内存值不一致的问题）。
+     * SQL: filled_quantity = filled_quantity + #{delta}
+     */
+    @Update("update trade_order set filled_quantity = filled_quantity + #{delta}, updated_at = now() " +
             "where id = #{id}")
-    int updateFilledQuantity(@Param("id") Long id, @Param("filledQuantity") BigDecimal filledQuantity);
+    int incrementFilledQuantity(@Param("id") Long id, @Param("delta") BigDecimal delta);
 
     /**
      * 查询所有活跃订单（用于启动时加载到内存订单簿）

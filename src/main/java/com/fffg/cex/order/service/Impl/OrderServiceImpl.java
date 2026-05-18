@@ -363,11 +363,11 @@ public class OrderServiceImpl implements OrderService {
             // 3. 卖方结算
             settleSeller(result, symbolPair);
 
-            // 4. 更新买单状态
-            updateOrderAfterTrade(result.getBuyOrderId(), result.getBuyOrderNo());
+            // 4. 更新买单状态（传入本次成交数量作为增量）
+            updateOrderAfterTrade(result.getBuyOrderId(), result.getBuyOrderNo(), result.getQuantity());
 
-            // 5. 更新卖单状态
-            updateOrderAfterTrade(result.getSellOrderId(), result.getSellOrderNo());
+            // 5. 更新卖单状态（传入本次成交数量作为增量）
+            updateOrderAfterTrade(result.getSellOrderId(), result.getSellOrderNo(), result.getQuantity());
         }
     }
 
@@ -547,9 +547,24 @@ public class OrderServiceImpl implements OrderService {
     }
 
     /**
-     * 成交后更新订单状态和已成交数量。
+     * 成交后增量更新订单已成交数量并判断订单状态。
+     * <p>
+     * 使用 {@link OrderMapper#incrementFilledQuantity} 以 SQL 增量方式更新，
+     * 确保撮合过程中多笔成交的 filledQuantity 正确累加（而非从 DB 读取旧值后覆盖）。
+     *
+     * @param orderId       订单 ID
+     * @param orderNo       订单号
+     * @param tradeQuantity 本次成交数量（增量）
      */
-    private void updateOrderAfterTrade(Long orderId, String orderNo) {
+    private void updateOrderAfterTrade(Long orderId, String orderNo, BigDecimal tradeQuantity) {
+        // 1. 增量更新已成交数量（原子操作）
+        int rows = orderMapper.incrementFilledQuantity(orderId, tradeQuantity);
+        if (rows != 1) {
+            log.error("订单已成交数量更新失败: orderId={}", orderId);
+            return;
+        }
+
+        // 2. 重新查询订单最新状态
         OrderVO order = orderMapper.selectById(orderId);
         if (order == null) {
             log.error("订单不存在: orderId={}", orderId);
@@ -559,10 +574,7 @@ public class OrderServiceImpl implements OrderService {
         BigDecimal filledQty = order.getFilledQuantity();
         BigDecimal totalQty = order.getQuantity();
 
-        // 更新已成交数量
-        orderMapper.updateFilledQuantity(orderId, filledQty);
-
-        // 更新订单状态
+        // 3. 更新订单状态
         if (filledQty.compareTo(totalQty) >= 0) {
             orderMapper.updateStatus(orderId, "FILLED");
             log.info("订单完全成交: orderId={}, orderNo={}", orderId, orderNo);

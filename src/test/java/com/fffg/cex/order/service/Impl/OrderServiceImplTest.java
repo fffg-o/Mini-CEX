@@ -318,22 +318,36 @@ class OrderServiceImplTest {
         OrderVO createdOrder = new OrderVO();
         createdOrder.setOrderId(1L);
         createdOrder.setOrderNo("ORD20250518000001");
-        createdOrder.setStatus("NEW");
-        createdOrder.setFilledQuantity(BigDecimal.ZERO);
+        createdOrder.setAccountId(100L);
+        createdOrder.setSymbol("BTCUSDT");
         createdOrder.setSide("BUY");
+        createdOrder.setOrderType("LIMIT");
+        createdOrder.setPrice(new BigDecimal("50000.00"));
+        createdOrder.setQuantity(new BigDecimal("0.001"));
+        createdOrder.setFilledQuantity(BigDecimal.ZERO);
+        createdOrder.setStatus("NEW");
 
         OrderVO filledOrder = new OrderVO();
         filledOrder.setOrderId(1L);
         filledOrder.setOrderNo("ORD20250518000001");
+        filledOrder.setAccountId(100L);
         filledOrder.setSymbol("BTCUSDT");
         filledOrder.setSide("BUY");
+        filledOrder.setOrderType("LIMIT");
         filledOrder.setPrice(new BigDecimal("50000.00"));
         filledOrder.setQuantity(new BigDecimal("0.001"));
         filledOrder.setStatus("PARTIALLY_FILLED");
         filledOrder.setFilledQuantity(new BigDecimal("0.0005"));
 
         // After matching, re-query returns updated order
+        // Call 1: line 194 in createOrder -> createdOrder (filled=0)
+        // Call 2: updateOrderAfterTrade -> filledOrder  (filled=0.0005)
+        // Call 3: line 204 in createOrder -> filledOrder
         when(orderMapper.selectById(1L)).thenReturn(createdOrder, filledOrder, filledOrder);
+
+        // Mock incremental filled quantity update
+        when(orderMapper.incrementFilledQuantity(eq(1L), any(BigDecimal.class))).thenReturn(1);
+        when(orderMapper.incrementFilledQuantity(eq(2L), any(BigDecimal.class))).thenReturn(1);
 
         OrderBook mockOrderBook = mock(OrderBook.class);
         when(orderBookManager.getOrderBook("BTCUSDT")).thenReturn(mockOrderBook);
@@ -372,6 +386,7 @@ class OrderServiceImplTest {
 
         assertNotNull(result);
         verify(tradeMapper).insert(any());
+        verify(orderMapper).incrementFilledQuantity(eq(1L), any(BigDecimal.class));
         verify(accountBalanceMapper, atLeastOnce()).addAvailableBalance(anyLong(), anyString(), any());
     }
 
