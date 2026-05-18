@@ -15,4 +15,10 @@ public interface SymbolPairMapper {
     @Select("select symbol,base_asset,quote_asset,price_scale,quantity_scale,min_order_amount,status " +
             "from symbol_pair where symbol = #{symbol}")
     SymbolPairVO selectBySymbol(@Param("symbol") String symbol);
+
+    /**
+     * 查询所有已启用的交易对 symbol 列表
+     */
+    @Select("select symbol from symbol_pair where status = 1")
+    List<String> selectEnabledSymbols();
 }

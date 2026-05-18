@@ -1486,7 +1486,18 @@ taker 费率：0.1% （吃单方）
 
 # 8. 行情模块 Market Data API
 
-行情模块用于展示订单簿、最新成交、ticker、K 线。第一阶段可以先不做，V3/V4 再实现。
+行情模块用于展示订单簿、最新成交、ticker、K 线等市场数据。这些数据对外部用户是只读查询接口，由撮合引擎成交后驱动更新。
+
+推荐包结构：
+
+```text
+com.fffg.cex.marketdata
+├── controller
+├── service
+├── mapper
+├── entity
+└── vo
+```
 
 ---
 
@@ -1494,14 +1505,14 @@ taker 费率：0.1% （吃单方）
 
 ### GET `/api/market/depth`
 
-查询指定交易对的订单簿深度。
+查询指定交易对的订单簿深度，返回当前所有活跃买单和卖单的聚合数量。
 
 #### Query 参数
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | symbol | String | 是 | 交易对，例如 BTCUSDT |
-| limit | Integer | 否 | 档位数量，默认 20 |
+| limit | Integer | 否 | 档位数量，默认 20，最大 100 |
 
 #### 请求示例
 
@@ -1530,27 +1541,86 @@ GET /api/market/depth?symbol=BTCUSDT&limit=20
 }
 ```
 
+#### VO 建议
+
+```java
+@Data
+public class MarketDepthVO {
+    private String symbol;
+    private List<String[]> bids;    // [price, quantity]
+    private List<String[]> asks;    // [price, quantity]
+    private Long timestamp;
+}
+```
+
+> **说明**：bids 和 asks 使用 `List<String[]>` 是因为 Binance 等交易所的 REST API 也使用此格式，每项为 `[price, quantity]` 字符串数组，前端解析更方便。
+
 #### 字段说明
 
 | 字段 | 说明 |
 |---|---|
-| bids | 买盘，价格从高到低 |
-| asks | 卖盘，价格从低到高 |
+| symbol | 交易对 |
+| bids | 买盘，价格从高到低排序 |
+| asks | 卖盘，价格从低到高排序 |
+| timestamp | 快照生成时间戳（毫秒） |
+
+#### 业务规则
+
+- `bids` 按价格降序排列（最高买价在前）。
+- `asks` 按价格升序排列（最低卖价在前）。
+- 只统计 `status IN ('NEW', 'PARTIALLY_FILLED')` 的活跃订单。
+- 同价格的订单数量合并后返回。
+- `quantity` 为 `quantity - filled_quantity`（剩余未成交数量）。
 
 #### 实现建议
 
-第一版可以直接从 `trade_order` 表中按价格聚合：
+**第一版（直接从数据库聚合）：**
 
 ```sql
-SELECT price, SUM(quantity - filled_quantity)
+-- 买单：按价格降序
+SELECT price, SUM(quantity - filled_quantity) AS total_remaining
 FROM trade_order
 WHERE symbol = ? AND side = 'BUY' AND status IN ('NEW', 'PARTIALLY_FILLED')
 GROUP BY price
 ORDER BY price DESC
-LIMIT ?
+LIMIT ?;
+
+-- 卖单：按价格升序
+SELECT price, SUM(quantity - filled_quantity) AS total_remaining
+FROM trade_order
+WHERE symbol = ? AND side = 'SELL' AND status IN ('NEW', 'PARTIALLY_FILLED')
+GROUP BY price
+ORDER BY price ASC
+LIMIT ?;
 ```
 
-后续再改成内存 OrderBook 或 Redis。
+该方法实现最简单，但高并发下数据库压力大。适合第一版快速验证。
+
+**第二版（内存 OrderBook 快照）：**
+
+在 [`OrderBook.java`](src/main/java/com/fffg/cex/matching/OrderBook.java) 中维护内存订单簿，每次撮合或撤单后更新，`/api/market/depth` 直接从内存读取：
+
+```java
+// OrderBook 中维护
+private final TreeMap<BigDecimal, BigDecimal> bids = new TreeMap<>(Comparator.reverseOrder());
+private final TreeMap<BigDecimal, BigDecimal> asks = new TreeMap<>(Comparator.naturalOrder());
+
+public MarketDepthVO getDepth(String symbol, int limit) {
+    // 从 TreeMap 中取前 limit 档
+    List<String[]> bidEntries = bids.entrySet().stream()
+        .limit(limit)
+        .map(e -> new String[]{e.getKey().toPlainString(), e.getValue().toPlainString()})
+        .collect(Collectors.toList());
+    // asks 同理
+    return new MarketDepthVO(symbol, bidEntries, askEntries, System.currentTimeMillis());
+}
+```
+
+#### 可能错误
+
+| code | message | 场景 |
+|---|---|---|
+| 40003 | 交易对不存在 | symbol 不存在或未启用 |
 
 ---
 
@@ -1558,14 +1628,20 @@ LIMIT ?
 
 ### GET `/api/market/trades`
 
-这个接口可以和 `/api/trades` 复用，也可以作为行情模块单独提供。
+查询某个交易对最近成交记录。该接口与 [`GET /api/trades`](mini_cex_api_design_doc.md:1187) 功能一致，但本接口返回格式更精简，适合行情展示。
 
 #### Query 参数
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| symbol | String | 是 | 交易对 |
-| limit | Integer | 否 | 数量，默认 50 |
+| symbol | String | 是 | 交易对，例如 BTCUSDT |
+| limit | Integer | 否 | 返回数量，默认 50，最大 200 |
+
+#### 请求示例
+
+```text
+GET /api/market/trades?symbol=BTCUSDT&limit=50
+```
 
 #### 响应示例
 
@@ -1575,6 +1651,7 @@ LIMIT ?
   "message": "success",
   "data": [
     {
+      "tradeId": 5001,
       "price": "59900",
       "quantity": "0.1",
       "amount": "5990",
@@ -1584,19 +1661,63 @@ LIMIT ?
 }
 ```
 
+#### VO 建议
+
+```java
+public class MarketTradeVO {
+    private Long tradeId;
+    private BigDecimal price;
+    private BigDecimal quantity;
+    private BigDecimal amount;
+    private LocalDateTime createdAt;
+}
+```
+
+#### 业务规则
+
+- 按成交时间倒序返回（最新成交在前）。
+- `limit` 最大不超过 200，防止一次查询数据量过大。
+- 数据来源为 [`trade_fill`](mini_cex_api_design_doc.md:2006) 表。
+
+#### 实现建议
+
+```java
+@GetMapping("/api/market/trades")
+public ApiResponse<List<MarketTradeVO>> getRecentTrades(
+        @RequestParam String symbol,
+        @RequestParam(defaultValue = "50") @Max(200) Integer limit) {
+    // 从 trade_fill 表查询最近 limit 条记录
+    // SELECT * FROM trade_fill WHERE symbol = ? ORDER BY created_at DESC LIMIT ?
+    List<MarketTradeVO> trades = tradeMapper.selectRecentBySymbol(symbol, limit);
+    return ApiResponse.success(trades);
+}
+```
+
+#### 可能错误
+
+| code | message | 场景 |
+|---|---|---|
+| 40003 | 交易对不存在 | symbol 不存在或未启用 |
+
 ---
 
 ## 8.3 查询 ticker
 
 ### GET `/api/market/ticker`
 
-查询某个交易对 24 小时行情概要。
+查询某个交易对 24 小时行情概要，包括最新价、开盘价、最高价、最低价、成交量、成交额、涨跌幅等。
 
 #### Query 参数
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| symbol | String | 是 | 交易对 |
+| symbol | String | 是 | 交易对，例如 BTCUSDT |
+
+#### 请求示例
+
+```text
+GET /api/market/ticker?symbol=BTCUSDT
+```
 
 #### 响应示例
 
@@ -1618,21 +1739,107 @@ LIMIT ?
 }
 ```
 
+#### VO 建议
+
+```java
+public class TickerVO {
+    private String symbol;
+    private BigDecimal lastPrice;        // 最新成交价
+    private BigDecimal openPrice;        // 24小时前开盘价
+    private BigDecimal highPrice;        // 24小时最高价
+    private BigDecimal lowPrice;         // 24小时最低价
+    private BigDecimal volume;           // 24小时成交量（基础币数量）
+    private BigDecimal amount;           // 24小时成交额（计价币数量）
+    private BigDecimal priceChange;      // 价格变化 = lastPrice - openPrice
+    private BigDecimal priceChangePercent; // 涨跌幅百分比，保留两位小数
+}
+```
+
+#### 字段计算规则
+
+| 字段 | 计算方式 |
+|---|---|
+| lastPrice | 最近一条成交记录的 price |
+| openPrice | 24 小时前第一条成交记录的 price，若没有数据则取 lastPrice |
+| highPrice | 24 小时内成交的最高 price |
+| lowPrice | 24 小时内成交的最低 price |
+| volume | 24 小时内所有成交的 quantity 之和 |
+| amount | 24 小时内所有成交的 amount 之和 |
+| priceChange | `lastPrice - openPrice` |
+| priceChangePercent | `(priceChange / openPrice) * 100`，保留两位小数 |
+
+#### 实现建议
+
+```sql
+-- 24 小时内 ticker 聚合查询
+SELECT
+    MAX(created_at) AS last_trade_time,
+    -- lastPrice：取最新一条成交价
+    (SELECT price FROM trade_fill
+     WHERE symbol = ? AND created_at >= NOW() - INTERVAL 24 HOUR
+     ORDER BY created_at DESC LIMIT 1) AS last_price,
+    -- 24h 前的开盘价
+    (SELECT price FROM trade_fill
+     WHERE symbol = ? AND created_at >= NOW() - INTERVAL 24 HOUR
+     ORDER BY created_at ASC LIMIT 1) AS open_price,
+    MAX(price) AS high_price,
+    MIN(price) AS low_price,
+    SUM(quantity) AS volume,
+    SUM(amount) AS amount
+FROM trade_fill
+WHERE symbol = ?
+  AND created_at >= NOW() - INTERVAL 24 HOUR;
+```
+
+#### 业务规则
+
+- 如果 24 小时内没有成交数据，返回最近一条成交价作为 lastPrice，openPrice 与 lastPrice 相同，priceChange = 0，priceChangePercent = 0。
+- 如果系统刚启动且没有任何成交记录，所有价格字段返回 `"0"`。
+- 建议加一层缓存，减少数据库查询频率，例如每 10 秒刷新一次。
+
+#### 缓存建议
+
+```java
+@Component
+public class TickerCache {
+    private final ConcurrentHashMap<String, TickerVO> cache = new ConcurrentHashMap<>();
+
+    @Scheduled(fixedRate = 10000) // 每 10 秒刷新
+    public void refreshTickers() {
+        List<String> symbols = symbolPairService.getEnabledSymbols();
+        for (String symbol : symbols) {
+            TickerVO ticker = tradeService.calculateTicker(symbol);
+            cache.put(symbol, ticker);
+        }
+    }
+
+    public TickerVO getTicker(String symbol) {
+        return cache.getOrDefault(symbol, TickerVO.empty(symbol));
+    }
+}
+```
+
+#### 可能错误
+
+| code | message | 场景 |
+|---|---|---|
+| 40003 | 交易对不存在 | symbol 不存在或未启用 |
+
 ---
 
 ## 8.4 查询 K 线
 
 ### GET `/api/market/klines`
 
-查询 K 线数据。
+查询 K 线（蜡烛图）数据，用于前端绘制图表。
 
 #### Query 参数
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| symbol | String | 是 | 交易对 |
-| interval | String | 是 | 周期，例如 `1m`, `5m`, `15m`, `1h`, `1d` |
-| limit | Integer | 否 | 数量，默认 100 |
+| symbol | String | 是 | 交易对，例如 BTCUSDT |
+| interval | String | 是 | 周期，支持 `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`, `1w` |
+| limit | Integer | 否 | 返回 K 线数量，默认 100，最大 500 |
 
 #### 请求示例
 
@@ -1660,31 +1867,176 @@ GET /api/market/klines?symbol=BTCUSDT&interval=1m&limit=100
 }
 ```
 
+#### VO 建议
+
+```java
+public class KlineVO {
+    private LocalDateTime openTime;    // K 线开盘时间
+    private BigDecimal openPrice;      // 开盘价
+    private BigDecimal highPrice;      // 最高价
+    private BigDecimal lowPrice;       // 最低价
+    private BigDecimal closePrice;     // 收盘价
+    private BigDecimal volume;         // 成交量（基础币）
+    private BigDecimal amount;         // 成交额（计价币）
+}
+```
+
+#### Interval 周期对照表
+
+| interval 值 | 说明 | 时间窗口 |
+|---|---|---|
+| `1m` | 1 分钟 | `FLOOR(分钟) * 1` |
+| `5m` | 5 分钟 | `FLOOR(分钟 / 5) * 5` |
+| `15m` | 15 分钟 | `FLOOR(分钟 / 15) * 15` |
+| `30m` | 30 分钟 | `FLOOR(分钟 / 30) * 30` |
+| `1h` | 1 小时 | `FLOOR(小时) * 1` |
+| `4h` | 4 小时 | `FLOOR(小时 / 4) * 4` |
+| `1d` | 1 天 | 按自然日 |
+| `1w` | 1 周 | 按自然周（周一开盘） |
+
+#### 业务规则
+
+- 按 `openTime` 降序返回（最新的 K 线在前）。
+- 每个 K 线的时间窗口根据 `interval` 和成交时间计算所属周期。
+- 一根 K 线包含该时间窗口内的所有成交记录聚合。
+- 如果某个时间窗口内没有成交记录，则**不返回**该 K 线（第一阶段简单处理）。
+
 #### 实现建议
 
-- 第一版可以不做。
-- 第二版可以根据 `trade_fill` 成交记录定时聚合。
-- 第三版可以在撮合成交时实时更新当前 K 线。
+**第一版（SQL 聚合，适用数据量小的阶段）：**
+
+```java
+public List<KlineVO> getKlines(String symbol, String interval, int limit) {
+    // 1. 计算时间窗口开始点（如 1m = 向下取整到分钟）
+    // 2. 按时间窗口分组聚合
+    // SQL 实现参考：
+    String sql = "SELECT " +
+        "FLOOR(UNIX_TIMESTAMP(created_at) / ?) * ? AS open_time, " +  // 时间窗口分组
+        "SUBSTRING_INDEX(GROUP_CONCAT(price ORDER BY created_at), ',', 1) AS open_price, " +
+        "MAX(price) AS high_price, " +
+        "MIN(price) AS low_price, " +
+        "SUBSTRING_INDEX(GROUP_CONCAT(price ORDER BY created_at DESC), ',', 1) AS close_price, " +
+        "SUM(quantity) AS volume, " +
+        "SUM(amount) AS amount " +
+        "FROM trade_fill " +
+        "WHERE symbol = ? AND created_at >= ? " +
+        "GROUP BY open_time " +
+        "ORDER BY open_time DESC LIMIT ?";
+    // 执行查询并映射为 KlineVO 列表
+}
+```
+
+> **注意**：`GROUP_CONCAT` 依赖数据库实现，MySQL 支持。如果使用 H2 内存数据库测试，需要改用其他方式。
+
+**第二版（定时任务聚合 + 缓存表，推荐）：**
+
+创建一张 `kline_data` 表，由定时任务定期从 `trade_fill` 聚合：
+
+```sql
+CREATE TABLE kline_data (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  symbol VARCHAR(32) NOT NULL,
+  interval_type VARCHAR(10) NOT NULL,   -- 1m, 5m, 1h, 1d
+  open_time DATETIME NOT NULL,
+  open_price DECIMAL(36,18) NOT NULL,
+  high_price DECIMAL(36,18) NOT NULL,
+  low_price DECIMAL(36,18) NOT NULL,
+  close_price DECIMAL(36,18) NOT NULL,
+  volume DECIMAL(36,18) NOT NULL,
+  amount DECIMAL(36,18) NOT NULL,
+  created_at DATETIME NOT NULL,
+  UNIQUE KEY uk_symbol_interval_time (symbol, interval_type, open_time)
+);
+```
+
+定时任务伪代码：
+
+```java
+@Component
+public class KlineAggregator {
+
+    @Scheduled(fixedRate = 60000) // 每 1 分钟聚合一次
+    public void aggregateKlines() {
+        // 1. 查询 trade_fill 中上次聚合时间至今的数据
+        // 2. 按 interval 分组聚合
+        // 3. 使用 INSERT ... ON DUPLICATE KEY UPDATE 写入 kline_data
+        // 4. 更新上次聚合时间游标
+    }
+}
+```
+
+**第三版（撮合时实时更新，高性能）：**
+
+在 [`MatchEngine`](src/main/java/com/fffg/cex/matching/MatchEngine.java) 每次成交后，直接更新当前时间窗口的内存 K 线对象，定时持久化到数据库。
+
+```java
+// MatchEngine 成交后调用
+public void onTrade(TradeFill trade) {
+    KlineCache.update(trade.getSymbol(), "1m", trade);
+    KlineCache.update(trade.getSymbol(), "5m", trade);
+    // ...
+}
+```
+
+#### K 线聚合逻辑伪代码
+
+```text
+function aggregateKlines(trades, interval):
+    grouped = groupBy(trades, t -> getWindowStart(t.createdAt, interval))
+    for each (windowStart, groupTrades) in grouped:
+        sorted = groupTrades.sortBy(createdAt)
+        kline.openPrice = sorted.first().price
+        kline.highPrice = sorted.max(price)
+        kline.lowPrice = sorted.min(price)
+        kline.closePrice = sorted.last().price
+        kline.volume = sum(sorted.quantity)
+        kline.amount = sum(sorted.amount)
+        kline.openTime = windowStart
+```
+
+#### 可能错误
+
+| code | message | 场景 |
+|---|---|---|
+| 40003 | 交易对不存在 | symbol 不存在或未启用 |
+| 40006 | 不支持的 K 线周期 | interval 不是支持的周期值 |
 
 ---
 
-# 9. 钱包模块 Wallet API，后续扩展
 
-钱包模块用于模拟 Web3 交易所的充值和提现。第一阶段建议只做 `mockDeposit`，真实钱包流程后续再做。
+# 9. 钱包模块 Wallet API
+
+钱包模块用于模拟交易所的充值和提现流程。与第 5.4 节的"模拟充值"不同，钱包模块提供更完整的 Web3 风格充提流程，包括充值地址、链上确认、提现审核等。
+
+> **开发阶段说明**：钱包模块属于 V5 扩展功能，建议在 V0-V4 全部完成后实现。第一阶段核心充提直接使用 [`5.4 模拟充值`](mini_cex_api_design_doc.md:538) 即可。
+
+推荐包结构：
+
+```text
+com.fffg.cex.wallet
+├── controller
+├── service
+├── mapper
+├── entity
+├── dto
+└── vo
+```
 
 ---
 
-## 9.1 获取充值地址，后续
+## 9.1 获取充值地址
 
 ### GET `/api/wallet/deposit-address`
+
+为指定账户和币种生成/查询充值地址。模拟场景下，系统为每个账户的每种币在每个链上生成一个固定地址。
 
 #### Query 参数
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | accountId | Long | 是 | 账户 ID |
-| assetSymbol | String | 是 | 币种 |
-| chain | String | 是 | 链，例如 ETH、BSC、TRON |
+| assetSymbol | String | 是 | 币种，例如 USDT |
+| chain | String | 是 | 链名称，例如 ETH、BSC、TRON |
 
 #### 响应示例
 
@@ -1701,19 +2053,94 @@ GET /api/market/klines?symbol=BTCUSDT&interval=1m&limit=100
 }
 ```
 
+#### VO 建议
+
+```java
+public class DepositAddressVO {
+    private Long accountId;
+    private String assetSymbol;
+    private String chain;
+    private String address;
+}
+```
+
+#### 业务规则
+
+- 账户必须存在。
+- 币种必须存在且启用。
+- 同一账户、同一币种、同一链的充值地址固定不变。
+- 第一次查询时自动生成地址，后续查询直接返回已有地址。
+- 地址生成规则：模拟场景下可以按 `accountId + assetSymbol + chain` 哈希取前 40 位作为地址。
+
+#### 地址生成示例
+
+```java
+public String generateAddress(Long accountId, String assetSymbol, String chain) {
+    String raw = accountId + ":" + assetSymbol + ":" + chain;
+    return "0x" + DigestUtils.sha256Hex(raw).substring(0, 40);
+}
+```
+
+#### 实现建议
+
+```java
+// 先用内存缓存模拟，后续可以建 deposit_address 表持久化
+@Component
+public class DepositAddressManager {
+    private final Map<String, String> addressCache = new ConcurrentHashMap<>();
+
+    public String getOrCreateAddress(Long accountId, String assetSymbol, String chain) {
+        String key = accountId + ":" + assetSymbol + ":" + chain;
+        return addressCache.computeIfAbsent(key, k -> generateAddress(accountId, assetSymbol, chain));
+    }
+}
+```
+
+#### 数据库表建议（后续扩展）
+
+```sql
+CREATE TABLE deposit_address (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  account_id BIGINT NOT NULL,
+  asset_symbol VARCHAR(20) NOT NULL,
+  chain VARCHAR(20) NOT NULL,
+  address VARCHAR(128) NOT NULL UNIQUE,
+  created_at DATETIME NOT NULL,
+  UNIQUE KEY uk_account_asset_chain (account_id, asset_symbol, chain)
+);
+```
+
+#### 可能错误
+
+| code | message | 场景 |
+|---|---|---|
+| 40001 | 账户不存在 | accountId 不存在 |
+| 40002 | 币种不存在 | assetSymbol 不存在或未启用 |
+| 40006 | 链参数不能为空 | chain 未传入或为空 |
+
 ---
 
-## 9.2 查询充值记录，后续
+## 9.2 查询充值记录
 
 ### GET `/api/wallet/deposits`
+
+查询指定账户的链上充值记录。
 
 #### Query 参数
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | accountId | Long | 是 | 账户 ID |
-| assetSymbol | String | 否 | 币种 |
-| status | String | 否 | 状态 |
+| assetSymbol | String | 否 | 币种筛选 |
+| status | String | 否 | 状态筛选，例如 `PENDING`, `SUCCESS`, `FAILED` |
+| pageNum | Integer | 否 | 页码，默认 1 |
+| pageSize | Integer | 否 | 每页数量，默认 20 |
+
+#### 请求示例
+
+```text
+GET /api/wallet/deposits?accountId=1&assetSymbol=USDT&status=SUCCESS&pageNum=1&pageSize=20
+```
 
 #### 响应示例
 
@@ -1721,26 +2148,113 @@ GET /api/market/klines?symbol=BTCUSDT&interval=1m&limit=100
 {
   "code": 0,
   "message": "success",
-  "data": [
-    {
-      "depositId": 1,
-      "assetSymbol": "USDT",
-      "chain": "ETH",
-      "txHash": "0xabc",
-      "amount": "100",
-      "confirmations": 12,
-      "status": "SUCCESS",
-      "createdAt": "2026-05-05T16:00:00"
-    }
-  ]
+  "data": {
+    "records": [
+      {
+        "depositId": 1,
+        "accountId": 1,
+        "assetSymbol": "USDT",
+        "chain": "ETH",
+        "txHash": "0xabc123def456",
+        "amount": "100.000000",
+        "confirmations": 12,
+        "requiredConfirmations": 12,
+        "status": "SUCCESS",
+        "createdAt": "2026-05-05T16:00:00",
+        "confirmedAt": "2026-05-05T16:05:00"
+      }
+    ],
+    "pageNum": 1,
+    "pageSize": 20,
+    "total": 1
+  }
 }
 ```
 
+#### VO 建议
+
+```java
+public class DepositRecordVO {
+    private Long depositId;
+    private Long accountId;
+    private String assetSymbol;
+    private String chain;
+    private String txHash;
+    private BigDecimal amount;
+    private Integer confirmations;          // 当前确认数
+    private Integer requiredConfirmations;  // 要求确认数
+    private String status;                  // PENDING / SUCCESS / FAILED
+    private LocalDateTime createdAt;
+    private LocalDateTime confirmedAt;
+}
+```
+
+#### 充值状态流转
+
+```text
+PENDING  --(确认数达到要求)--> SUCCESS
+PENDING  --(链上失败)-------> FAILED
+```
+
+#### 业务规则
+
+- 充值记录创建时状态为 `PENDING`。
+- `confirmations` 初始为 0，模拟定时任务递增确认数。
+- 当 `confirmations >= requiredConfirmations` 时，状态变为 `SUCCESS`，同时**增加账户余额**并记录流水。
+- 余额增加逻辑复用 [`DepositRequest`](mini_cex_api_design_doc.md:561) 的幂等充值逻辑。
+- 充值到账后，`confirmedAt` 记录到账时间。
+
+#### 模拟确认任务
+
+```java
+@Component
+public class DepositConfirmationSimulator {
+
+    @Scheduled(fixedRate = 5000) // 每 5 秒模拟一次
+    public void simulateConfirmations() {
+        // 1. 查询所有 status = 'PENDING' 的充值记录
+        // 2. 每笔记录的 confirmations += 1
+        // 3. 如果 confirmations >= requiredConfirmations：
+        //    a. 更新 status = 'SUCCESS'
+        //    b. 调用 accountService.deposit() 增加余额
+        //    c. 记录 confirmedAt
+    }
+}
+```
+
+#### 数据库表建议
+
+```sql
+CREATE TABLE deposit_record (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  account_id BIGINT NOT NULL,
+  asset_symbol VARCHAR(20) NOT NULL,
+  chain VARCHAR(20) NOT NULL,
+  tx_hash VARCHAR(128) NOT NULL UNIQUE,
+  amount DECIMAL(36,18) NOT NULL,
+  confirmations INT NOT NULL DEFAULT 0,
+  required_confirmations INT NOT NULL DEFAULT 12,
+  status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+  created_at DATETIME NOT NULL,
+  confirmed_at DATETIME,
+  INDEX idx_account_id (account_id),
+  INDEX idx_status (status)
+);
+```
+
+#### 可能错误
+
+| code | message | 场景 |
+|---|---|---|
+| 40001 | 账户不存在 | accountId 不存在 |
+
 ---
 
-## 9.3 提现申请，后续
+## 9.3 提现申请
 
 ### POST `/api/wallet/withdraws`
+
+提交提现申请。系统先冻结资产，然后进入审核流程。
 
 #### 请求体
 
@@ -1755,14 +2269,36 @@ GET /api/market/klines?symbol=BTCUSDT&interval=1m&limit=100
 }
 ```
 
-#### 业务规则
+#### DTO 建议
 
-- 账户必须存在。
-- 币种必须存在。
-- 提现金额必须大于 0。
-- 可用余额必须大于等于 `amount + fee`。
-- 提现申请先冻结资产。
-- 大额提现进入人工审核。
+```java
+public class WithdrawRequestDTO {
+    @NotNull(message = "账户ID不能为空")
+    private Long accountId;
+
+    @NotBlank(message = "币种不能为空")
+    private String assetSymbol;
+
+    @NotBlank(message = "链不能为空")
+    private String chain;
+
+    @NotBlank(message = "提现地址不能为空")
+    private String toAddress;
+
+    @NotNull(message = "提现金额不能为空")
+    @DecimalMin(value = "0.00000001", message = "提现金额必须大于0")
+    private BigDecimal amount;
+
+    @NotNull(message = "手续费不能为空")
+    @DecimalMin(value = "0", message = "手续费不能为负数")
+    private BigDecimal fee;
+
+    /**
+     * 幂等键（可选），防止重复提交
+     */
+    private String businessId;
+}
+```
 
 #### 响应示例
 
@@ -1777,32 +2313,348 @@ GET /api/market/klines?symbol=BTCUSDT&interval=1m&limit=100
 }
 ```
 
+#### VO 建议
+
+```java
+public class WithdrawResultVO {
+    private Long withdrawId;
+    private String status;  // REVIEWING / APPROVED / REJECTED / COMPLETED / FAILED
+}
+```
+
+#### 提现状态流转
+
+```text
+REVIEWING  --(审核通过)--> APPROVED --(链上处理)--> COMPLETED
+REVIEWING  --(审核拒绝)--> REJECTED
+APPROVED   --(链上失败)--> FAILED
+```
+
+#### 业务规则
+
+- 账户必须存在。
+- 币种必须存在且启用。
+- 提现金额必须大于 0。
+- 手续费可以为 0（但不可为负数）。
+- **可用余额必须大于等于 `amount + fee`**。
+- 使用条件更新冻结资产，防止超扣：
+
+```sql
+UPDATE account_balance
+SET available_balance = available_balance - ?,
+    frozen_balance = frozen_balance + ?,
+    updated_at = NOW()
+WHERE account_id = ?
+  AND asset_symbol = ?
+  AND available_balance >= ?;
+```
+
+- 冻结金额 = `amount + fee`。
+- 大额提现规则：单笔金额 ≥ 10000 USDT 或等值自动进入人工审核；小额提现可配置为自动审核通过。
+- 冻结资产后，记录 [`asset_ledger`](mini_cex_api_design_doc.md:1961) 流水（`businessType = WITHDRAW_FREEZE`）。
+- 提现申请使用 `@Transactional` 保证事务一致性。
+
+#### 实现注意
+
+```java
+@Transactional(rollbackFor = Exception.class)
+public WithdrawResultVO applyWithdraw(WithdrawRequestDTO request) {
+    // 1. 校验账户存在
+    // 2. 校验币种存在且启用
+    // 3. 校验余额充足（可用余额 >= amount + fee）
+    // 4. 条件更新冻结资产
+    // 5. 创建提现记录（status = REVIEWING 或 AUTO_APPROVED）
+    // 6. 生成资产流水（WITHDRAW_FREEZE）
+    // 7. 如果小额自动审核，直接进入 APPROVED 并触发后续流程
+}
+```
+
+#### 提现金额与冻结示例
+
+```text
+提现 100 USDT，手续费 1 USDT
+冻结金额 = 100 + 1 = 101 USDT
+
+余额变化：
+USDT availableBalance -101
+USDT frozenBalance  +101
+
+流水：
+businessType = WITHDRAW_FREEZE
+changeAvailable = -101
+changeFrozen = +101
+```
+
+#### 数据库表建议
+
+```sql
+CREATE TABLE withdraw_record (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  account_id BIGINT NOT NULL,
+  asset_symbol VARCHAR(20) NOT NULL,
+  chain VARCHAR(20) NOT NULL,
+  to_address VARCHAR(128) NOT NULL,
+  amount DECIMAL(36,18) NOT NULL,
+  fee DECIMAL(36,18) NOT NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'REVIEWING',
+  tx_hash VARCHAR(128),
+  business_id VARCHAR(64) UNIQUE,
+  created_at DATETIME NOT NULL,
+  updated_at DATETIME NOT NULL,
+  INDEX idx_account_id (account_id),
+  INDEX idx_status (status)
+);
+```
+
+#### 可能错误
+
+| code | message | 场景 |
+|---|---|---|
+| 40001 | 账户不存在 | accountId 不存在 |
+| 40002 | 币种不存在 | assetSymbol 不存在或未启用 |
+| 40004 | 余额不足 | 可用余额小于 amount + fee |
+| 40006 | 提现金额或手续费不合法 | 参数校验失败 |
+| 40010 | 重复请求 | businessId 已存在 |
+
 ---
 
-## 9.4 查询提现记录，后续
+## 9.4 查询提现记录
 
 ### GET `/api/wallet/withdraws`
+
+查询指定账户的提现记录列表。
 
 #### Query 参数
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | accountId | Long | 是 | 账户 ID |
-| status | String | 否 | 状态 |
+| status | String | 否 | 状态筛选，例如 `REVIEWING`, `APPROVED`, `REJECTED` |
+| pageNum | Integer | 否 | 页码，默认 1 |
+| pageSize | Integer | 否 | 每页数量，默认 20 |
+
+#### 请求示例
+
+```text
+GET /api/wallet/withdraws?accountId=1&status=REVIEWING&pageNum=1&pageSize=20
+```
+
+#### 响应示例
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "records": [
+      {
+        "withdrawId": 1,
+        "accountId": 1,
+        "assetSymbol": "USDT",
+        "chain": "ETH",
+        "toAddress": "0xabcdef123456",
+        "amount": "100.000000",
+        "fee": "1.000000",
+        "status": "REVIEWING",
+        "txHash": null,
+        "createdAt": "2026-05-05T16:00:00"
+      }
+    ],
+    "pageNum": 1,
+    "pageSize": 20,
+    "total": 1
+  }
+}
+```
+
+#### VO 建议
+
+```java
+public class WithdrawRecordVO {
+    private Long withdrawId;
+    private Long accountId;
+    private String assetSymbol;
+    private String chain;
+    private String toAddress;
+    private BigDecimal amount;
+    private BigDecimal fee;
+    private String status;
+    private String txHash;
+    private LocalDateTime createdAt;
+}
+```
+
+#### 业务规则
+
+- 按创建时间倒序排列。
+- 支持按 `status` 筛选，不传则查询所有状态。
 
 ---
 
-## 9.5 管理端审核提现，后续
+## 9.5 管理端审核提现
 
 ### POST `/api/admin/withdraws/{withdrawId}/approve`
 
-审核通过提现。
+审核通过提现申请，将提现状态更新为 `APPROVED`，等待后续链上处理。
+
+#### Path 参数
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| withdrawId | Long | 是 | 提现记录 ID |
+
+#### 响应示例
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "withdrawId": 1,
+    "status": "APPROVED"
+  }
+}
+```
+
+#### 业务规则
+
+- 提现记录必须存在。
+- 只有 `REVIEWING` 状态的提现可以审核通过。
+- 审核通过后状态变为 `APPROVED`。
+- 状态变更后，触发模拟链上处理任务（可选）。
+
+#### 实现建议
+
+```java
+@Transactional(rollbackFor = Exception.class)
+public void approveWithdraw(Long withdrawId) {
+    WithdrawRecord record = withdrawMapper.selectById(withdrawId);
+    if (record == null) {
+        throw new BusinessException(ErrorCode.WITHDRAW_NOT_FOUND);
+    }
+    if (!"REVIEWING".equals(record.getStatus())) {
+        throw new BusinessException(ErrorCode.INVALID_WITHDRAW_STATUS);
+    }
+    // 更新状态为 APPROVED
+    withdrawMapper.updateStatus(withdrawId, "REVIEWING", "APPROVED");
+    // 可触发链上处理模拟
+}
+```
+
+---
 
 ### POST `/api/admin/withdraws/{withdrawId}/reject`
 
-审核拒绝提现，并释放冻结资产。
+审核拒绝提现申请，释放之前冻结的资产。
+
+#### Path 参数
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| withdrawId | Long | 是 | 提现记录 ID |
+
+#### 响应示例
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "withdrawId": 1,
+    "status": "REJECTED"
+  }
+}
+```
+
+#### 业务规则
+
+- 提现记录必须存在。
+- 只有 `REVIEWING` 状态的提现可以拒绝。
+- 拒绝时需**解冻之前冻结的资产**（`amount + fee`）。
+- 解冻资产、更新状态、插入流水必须在同一个事务中。
+
+#### 解冻逻辑
+
+```sql
+UPDATE account_balance
+SET available_balance = available_balance + ?,
+    frozen_balance = frozen_balance - ?,
+    updated_at = NOW()
+WHERE account_id = ?
+  AND asset_symbol = ?;
+```
+
+流水：
+
+```text
+businessType = WITHDRAW_UNFREEZE
+changeAvailable = +(amount + fee)
+changeFrozen = -(amount + fee)
+```
+
+#### 实现建议
+
+```java
+@Transactional(rollbackFor = Exception.class)
+public void rejectWithdraw(Long withdrawId) {
+    // 1. 查询提现记录
+    // 2. 校验状态为 REVIEWING
+    // 3. 更新状态为 REJECTED
+    // 4. 解冻资产（可用余额 += amount + fee, 冻结余额 -= amount + fee）
+    // 5. 插入 asset_ledger 流水（WITHDRAW_UNFREEZE）
+}
+```
+
+#### 可能错误（审核相关）
+
+| code | message | 场景 |
+|---|---|---|
+| 40016 | 提现记录不存在 | withdrawId 不存在 |
+| 40017 | 提现状态非法 | 非 REVIEWING 状态的提现不能审核 |
 
 ---
+
+## 9.6 模拟链上提现完成（内部调度，非 API）
+
+提现审核通过后，系统内部模拟链上处理完成，将状态从 `APPROVED` 转为 `COMPLETED`，并从冻结余额中扣除资产。
+
+```java
+@Component
+public class WithdrawCompletionSimulator {
+
+    @Scheduled(fixedRate = 30000) // 每 30 秒模拟一次
+    public void simulateCompletion() {
+        // 1. 查询所有 status = 'APPROVED' 的提现记录
+        // 2. 模拟链上处理：
+        //    a. 扣除冻结余额（frozen_balance -= amount + fee）
+        //    b. 插入流水（WITHDRAW_COMPLETE）
+        //    c. 更新 status = 'COMPLETED'
+        //    d. 记录 txHash
+    }
+}
+```
+
+```text
+链上完成时资产变化：
+USDT frozenBalance -(amount + fee)
+
+流水：
+businessType = WITHDRAW_COMPLETE
+changeFrozen = -(amount + fee)
+```
+
+---
+
+## 9.7 钱包模块流水类型汇总
+
+| businessType | 说明 | 可用余额变化 | 冻结余额变化 |
+|---|---|---|---|
+| WITHDRAW_FREEZE | 提现冻结 | - (amount + fee) | + (amount + fee) |
+| WITHDRAW_UNFREEZE | 提现拒绝解冻 | + (amount + fee) | - (amount + fee) |
+| WITHDRAW_COMPLETE | 提现完成扣减 | 0 | - (amount + fee) |
+
+---
+
 
 # 10. WebSocket 行情接口，后续扩展
 
@@ -1869,6 +2721,8 @@ public enum ErrorCode {
     ORDER_NOT_FOUND(40008, "订单不存在"),
     ASSET_BALANCE_NOT_FOUND(40009, "资产余额不存在"),
     DUPLICATE_REQUEST(40010, "重复请求"),
+    WITHDRAW_NOT_FOUND(40016, "提现记录不存在"),
+    INVALID_WITHDRAW_STATUS(40017, "提现状态非法"),
     SYSTEM_ERROR(50000, "系统异常");
 }
 ```
@@ -1893,6 +2747,8 @@ public enum ErrorCode {
 | 40013 | 价格小数位数超出限制 | 价格精度超过交易对的 priceScale |
 | 40014 | 数量小数位数超出限制 | 数量精度超过交易对的 quantityScale |
 | 40015 | 订单金额小于最小交易金额 | price * quantity < minOrderAmount |
+| 40016 | 提现记录不存在 | withdrawId 无效 |
+| 40017 | 提现状态非法 | 非 REVIEWING 状态的提现不能审核 |
 | 50000 | 系统异常 | 未知异常 |
 
 ---
@@ -2178,6 +3034,15 @@ README 不需要写所有细节，只写核心接口索引。
 | POST | /api/orders/{orderId}/cancel | 撤销订单 |
 | GET | /api/trades | 查询成交记录 |
 | GET | /api/market/depth | 查询订单簿 |
+| GET | /api/market/trades | 查询最新成交（行情） |
+| GET | /api/market/ticker | 查询 24h ticker |
+| GET | /api/market/klines | 查询 K 线 |
+| GET | /api/wallet/deposit-address | 获取充值地址 |
+| GET | /api/wallet/deposits | 查询充值记录 |
+| POST | /api/wallet/withdraws | 提现申请 |
+| GET | /api/wallet/withdraws | 查询提现记录 |
+| POST | /api/admin/withdraws/{withdrawId}/approve | 审核通过提现 |
+| POST | /api/admin/withdraws/{withdrawId}/reject | 审核拒绝提现 |
 ```
 
 ---

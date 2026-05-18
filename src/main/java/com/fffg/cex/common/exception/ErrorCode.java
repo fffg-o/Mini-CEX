@@ -20,12 +20,17 @@ public enum ErrorCode {
     ASSET_BALANCE_NOT_FOUND(40009, "资产余额不存在"),
     DUPLICATE_REQUEST(40010, "重复请求"),
 
-    // 撮合相关 40011-40020
+    // 撮合相关 40011-40015
     ORDER_FULLY_FILLED(40011, "订单已完全成交，无法撤销"),
     ORDER_ALREADY_CANCELED(40012, "订单已撤销"),
     PRICE_SCALE_INVALID(40013, "价格小数位数超出交易对限制"),
     QUANTITY_SCALE_INVALID(40014, "数量小数位数超出交易对限制"),
     ORDER_AMOUNT_TOO_SMALL(40015, "订单金额小于最小交易金额"),
+
+    // 钱包相关 40016-40020
+    WITHDRAW_NOT_FOUND(40016, "提现记录不存在"),
+    INVALID_WITHDRAW_STATUS(40017, "提现状态非法"),
+    DEPOSIT_NOT_FOUND(40018, "充值记录不存在"),
 
     // 系统异常
     SYSTEM_ERROR(50000, "系统异常");

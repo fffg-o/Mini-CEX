@@ -89,4 +89,18 @@ public interface AccountBalanceMapper {
             "  and asset_symbol = #{assetSymbol} " +
             "  and available_balance >= #{amount}")
     int subtractAvailableBalance(@Param("accountId") Long accountId, @Param("assetSymbol") String assetSymbol, @Param("amount") BigDecimal amount);
+
+    /**
+     * 获取指定账户指定币种的可用余额
+     */
+    @Select("select available_balance from account_balance " +
+            "where account_id = #{accountId} and asset_symbol = #{assetSymbol}")
+    BigDecimal getAvailableBalance(@Param("accountId") Long accountId, @Param("assetSymbol") String assetSymbol);
+
+    /**
+     * 获取指定账户指定币种的冻结余额
+     */
+    @Select("select frozen_balance from account_balance " +
+            "where account_id = #{accountId} and asset_symbol = #{assetSymbol}")
+    BigDecimal getFrozenBalance(@Param("accountId") Long accountId, @Param("assetSymbol") String assetSymbol);
 }
